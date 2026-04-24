@@ -26,7 +26,8 @@ import random
 import numpy as np
 from pydub import AudioSegment
 from pydub.generators import Sine
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, sosfilt, resample_poly
+from math import gcd
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────
 
@@ -40,13 +41,16 @@ OUTPUT_DIR     = f"{DRIVE_BASE}/Dataset"
 CLIP_DURATION_MS  = 45_000   # 45 seconds in milliseconds
 GAP_DURATION_MS   = 3_000    # 3 second silence between clips
 BEEP_DURATION_MS  = 1_000    # 1 second beep before each clip
-BEEP_FREQ_HZ      = 1000     # 1kHz tone — clearly visible in PRAAT
-SAMPLE_RATE       = 48_000   # Hz — matches RAVDESS and DEMAND native rate
+BEEP_FREQ_HZ      = 300     # 300Hz tone — clearly visible in PRAAT
+SAMPLE_RATE       = 8_000   # Hz — Downsampling down to 8000
 TARGET_DBFS       = -20.0    # Target loudness for normalization
 
 # Dataset parameters
 CLIPS_PER_CLASS        = 60
 CLIPS_PER_ENV_CLASS    = 10  # 60 clips / 6 environments = 10 per env per class
+
+#Feasibility mode - generates only 10 clips to test Pi pipeline
+FEASIBILITY_MODE = False
 
 # SNR range for mixing speech over background (Classes 1 and 2)
 SNR_MIN_DB = 5.0
@@ -91,6 +95,8 @@ def make_silence(duration_ms):
 
 def normalize(segment, target_dbfs=TARGET_DBFS):
     """Normalize audio to a target dBFS level."""
+    if segment.dBFS == float('-inf'):
+        return segment  # silent segment — don't amplify noise floor
     delta = target_dbfs - segment.dBFS
     return segment.apply_gain(delta)
 
@@ -158,8 +164,45 @@ def load_demand(env_name):
     if not os.path.exists(path):
         raise FileNotFoundError(f"DEMAND file not found: {path}")
     seg = AudioSegment.from_wav(path)
-    seg = seg.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
+    seg = seg.set_channels(1).set_sample_width(2)
+    seg = resample_audio(seg, SAMPLE_RATE)
     return seg
+
+def lowpass_filter(samples, src_rate, cutoff_hz):
+    """Apply an 8th-order Butterworth low-pass filter to float32 samples."""
+    nyq = src_rate / 2.0
+    sos = butter(8, cutoff_hz / nyq, btype='low', output='sos')
+    return sosfilt(sos, samples)
+
+def resample_audio(segment, target_rate):
+    """Resample the pydub AudioSegment to target_rate using scipy.
+    Applies a Butterworth LPF before downsampling to suppress aliasing."""
+    samples = np.array(segment.get_array_of_samples()).astype(np.float32)
+    src_rate = segment.frame_rate
+
+    # Only filter when downsampling; cutoff at 90% of target Nyquist
+    if target_rate < src_rate:
+        cutoff = 0.9 * (target_rate / 2.0)
+        samples = lowpass_filter(samples, src_rate, cutoff)
+
+    # Compute up/down factors as a reduced fraction
+    g = gcd(target_rate, src_rate)
+    up = target_rate // g
+    down = src_rate // g
+
+    resampled = resample_poly(samples, up, down)
+    peak = np.abs(resampled).max()
+    if peak > 32767:
+        resampled = resampled * (32767 / peak)  # scale down to prevent clipping
+    resampled = resampled.astype(np.int16)
+
+    return AudioSegment(
+        data=resampled.tobytes(),
+        frame_rate=target_rate,
+        sample_width=2,
+        channels=1
+    )
+
 
 # ─── CLIP BUILDERS ─────────────────────────────────────────────────────────
 
@@ -187,7 +230,8 @@ def build_speech_clip(ravdess_files, demand_env, snr_db):
     while len(speech_track) < CLIP_DURATION_MS:
         chosen = random.choice(ravdess_files)
         seg = AudioSegment.from_wav(chosen)
-        seg = seg.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
+        seg = seg.set_channels(1).set_sample_width(2)
+        seg = resample_audio(seg, SAMPLE_RATE)
         # Add short silence between utterances (natural pause)
         pause = make_silence(random.randint(300, 800))
         speech_track += seg + pause
@@ -231,6 +275,7 @@ def assemble_dataset():
     silence = make_silence(GAP_DURATION_MS)
     records = []         # for labels CSV
     all_clips = []       # ordered list of all 180 clips for concatenation
+    clip_store = {}      # fname → AudioSegment, avoids re-reading from disk
     clip_idx  = 0
 
     # ── Generate all clips ──────────────────────────────────────
@@ -239,6 +284,10 @@ def assemble_dataset():
 
         for env in DEMAND_ENVS:
             for i in range(CLIPS_PER_ENV_CLASS):
+                #Feasibility cutoff
+                if FEASIBILITY_MODE and clip_idx >= 10:
+                    break
+
                 clip_idx += 1
 
                 if class_label == 0:
@@ -257,6 +306,9 @@ def assemble_dataset():
                 fname = f"{class_name}_{env}_{i+1:03d}.wav"
                 fpath = os.path.join(OUTPUT_DIR, class_name, fname)
                 clip.export(fpath, format="wav")
+
+                # Keep in memory to avoid re-reading from disk during assembly
+                clip_store[fname] = clip
 
                 # Store for concatenation
                 all_clips.append((clip_idx, fname, class_label,
@@ -278,9 +330,8 @@ def assemble_dataset():
     for order_idx, (clip_idx, fname, class_label,
                     class_name, env, snr_used, ravdess_used) in enumerate(all_clips):
 
-        # Load the individual clip we already saved
-        clip_path = os.path.join(OUTPUT_DIR, class_name, fname)
-        clip = AudioSegment.from_wav(clip_path)
+        # Use in-memory clip to avoid a redundant encode/decode cycle
+        clip = clip_store[fname]
 
         # Record timestamp BEFORE appending beep+silence
         # so timestamp points to actual clip start
