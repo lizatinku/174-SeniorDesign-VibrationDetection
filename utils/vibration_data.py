@@ -14,6 +14,33 @@ TransformFn = Callable[[torch.Tensor], torch.Tensor]
 NumpyTransformFn = Callable[[np.ndarray], np.ndarray]
 
 
+def bandpass_waveform(
+    x: np.ndarray,
+    sample_rate: float,
+    low_hz: float,
+    high_hz: float,
+    order: int = 4,
+) -> np.ndarray:
+    """
+    Zero-phase band-pass (SOS + forward–backward filt) on a 1D float waveform.
+
+    Apply on the raw (windowed) signal before spectrogram / normalization so the passband
+    matches true analog frequencies.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    nyq = sample_rate / 2.0
+    if low_hz <= 0 or high_hz <= low_hz or high_hz >= nyq:
+        raise ValueError(
+            f"bandpass must satisfy 0 < low_hz < high_hz < Nyquist ({nyq:g} Hz for "
+            f"sample_rate={sample_rate}); got low_hz={low_hz}, high_hz={high_hz}"
+        )
+
+    sos = butter(order, [low_hz / nyq, high_hz / nyq], btype="band", output="sos")
+    y = sosfiltfilt(sos, x)
+    return y.astype(x.dtype, copy=False)
+
+
 class SplitVibrationDataset(Dataset):
     """
     One dataset class supporting two behaviors:
@@ -31,6 +58,8 @@ class SplitVibrationDataset(Dataset):
         transform_before_normalize: NumpyTransformFn | None = None,
         transform: TransformFn | None = None,
         dtype: np.dtype | type = np.float32,
+        bandpass_hz: tuple[float, float] | None = None,
+        bandpass_order: int = 4,
     ) -> None:
         if split not in {"train", "val"}:
             raise ValueError("split must be 'train' or 'val'")
@@ -45,6 +74,9 @@ class SplitVibrationDataset(Dataset):
         self.transform_before_normalize = transform_before_normalize
         self.transform = transform
         self.dtype = dtype
+        self.sample_rate_f = float(sample_rate)
+        self.bandpass_hz = bandpass_hz
+        self.bandpass_order = int(bandpass_order)
 
         if len(self.records) == 0:
             raise RuntimeError(f"No records found for split '{split}'")
@@ -97,6 +129,12 @@ class SplitVibrationDataset(Dataset):
             y = int(row["label_id"])
             x_arr = self._segment_or_pad_val(x_full, start)
 
+        if self.bandpass_hz is not None:
+            lo, hi = self.bandpass_hz
+            x_arr = bandpass_waveform(
+                x_arr, self.sample_rate_f, lo, hi, order=self.bandpass_order
+            )
+
         if self.transform_before_normalize is not None:
             x_arr = self.transform_before_normalize(x_arr)
 
@@ -120,6 +158,8 @@ def make_train_val_datasets(
     transform_before_normalize: NumpyTransformFn | None = None,
     transform: TransformFn | None = None,
     dtype: np.dtype | type = np.float32,
+    bandpass_hz: tuple[float, float] | None = None,
+    bandpass_order: int = 4,
 ) -> tuple[SplitVibrationDataset, SplitVibrationDataset]:
     """Stratified split by label, then create train/val dataset objects."""
     if not (0.0 < train_ratio < 1.0):
@@ -169,6 +209,8 @@ def make_train_val_datasets(
         transform_before_normalize=transform_before_normalize,
         transform=transform,
         dtype=dtype,
+        bandpass_hz=bandpass_hz,
+        bandpass_order=bandpass_order,
     )
     train_ds = SplitVibrationDataset(train_records, split="train", **kwargs)
     val_ds = SplitVibrationDataset(val_records, split="val", **kwargs)
